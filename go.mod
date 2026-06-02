@@ -1,4 +1,4 @@
-module autobench
+module github.com/quark-idlemind/autobench
 
 go 1.26.1
 
