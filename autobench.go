@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	"autobench/bench"
+	"github.com/quark-idlemind/autobench/bench"
 
 	"github.com/pborman/options"
 )
