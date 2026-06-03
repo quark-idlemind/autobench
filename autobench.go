@@ -1,4 +1,3 @@
-// Program gen is used to generate benchmark tests for the automate program.
 package main
 
 import (
@@ -14,8 +13,8 @@ import (
 )
 
 var flags = struct {
-	Preamble  string   `getopt:"--preamble=PREMBLE Make STR the tests's preamble"`
-	Postamble string   `getopt:"--postamble=POSTAMBLE Make STR the tests's postamble"`
+	Preamble  string   `getopt:"--preamble=PREAMBLE Make STR the test's preamble"`
+	Postamble string   `getopt:"--postamble=POSTAMBLE Make STR the test's postamble"`
 	Code      string   `getopt:"--code=CODE code to test"`
 	Statement string   `getopt:"--statement=CODE statement(s) to test"`
 	Pad       string   `getopt:"--pad=PAD padding instructions"`
@@ -26,6 +25,8 @@ var flags = struct {
 	Params    []string `getopt:"--params=NAME,... parameters used with --statement"`
 	Locals    []string `getopt:"--locals=NAME,... locals used with --statement"`
 	Globals   []string `getopt:"--globals=NAME,... declare globals"`
+	One       bool     `getopt:"-1 Using padding and a single copy of CODE"`
+	IPad      int      `getopt:"--ipad=N initial guess at padding for -1"`
 }{}
 
 func init() {
@@ -111,20 +112,117 @@ func main() {
 	}
 
 	var r Results
+
+	if flags.One {
+		low := 0
+		high := 512
+		mid := (high - low) / 2
+		pad := 0
+		if flags.IPad != 0 {
+			if err := runScript(b, 0, flags.IPad-1, &r); err != nil {
+				errf("%v\n", err)
+			}
+			base := r.Base
+			if err := runScript(b, 0, flags.IPad, &r); err != nil {
+				errf("%v\n", err)
+			}
+			if base != r.Base {
+				pad = flags.IPad
+			} else {
+				mid = flags.IPad
+			}
+		} else {
+			if err := runScript(b, 0, 0, &r); err != nil {
+				errf("%v\n", err)
+			}
+		}
+		if pad == 0 {
+			base := r.Base
+			for high-low > 1 {
+				if err := runScript(b, 0, mid, &r); err != nil {
+					errf("%v\n", err)
+				}
+				if base == r.Base {
+					low = mid
+				} else {
+					high = mid
+				}
+				mid = low + (high-low)/2
+			}
+			if low > 4 {
+				if err := runScript(b, 0, low+1, &r); err != nil {
+					errf("%v\n", err)
+				}
+				if base == r.Base {
+					low++
+				}
+			}
+			pad = low + 1 // bump us over
+		}
+
+		if err := runScript(b, 1, pad, &r); err != nil {
+			errf("%v\n", err)
+		}
+		low = 0
+		high = 512
+		mid = (high - low) / 2
+		test := r.Test
+		for high-low > 1 {
+			if err := runScript(b, 1, mid+pad, &r); err != nil {
+				errf("%v\n", err)
+			}
+			if test == r.Test {
+				low = mid
+			} else {
+				high = mid
+			}
+			mid = low + (high-low)/2
+		}
+		if low > 4 {
+			if err := runScript(b, 1, low+1+pad, &r); err != nil {
+				errf("%v\n", err)
+			}
+			if test == r.Test {
+				low++
+			}
+		}
+		low += 1 // bumps us over
+		if err := runScript(b, 1, low+pad, &r); err != nil {
+			errf("%v\n", err)
+		}
+
+		if r.Title != "" {
+			fmt.Printf("Title: %s\n", r.Title)
+		}
+
+		fmt.Printf("Padding: %d\n", pad)
+		fmt.Printf("Size: %d\n", r.Test - r.Base -low)
+		return
+	}
+
 	// Get the base result
-	if err := runScript(b, 0, &r); err != nil {
+	if err := runScript(b, 0, 0, &r); err != nil {
 		errf("%v\n", err)
 	}
 
-	if err := runScript(b, 4, &r); err != nil {
+	D := 4
+	if err := runScript(b, D, 0, &r); err != nil {
 		errf("%v\n", err)
 	}
+/*
+	if r.Size == 0 {
+		D = 8
+		if err := runScript(b, D, 0, &r); err != nil {
+			errf("%v\n", err)
+		}
+	}
 	var cnt int
+*/
 	if r.Size == 0 {
 		cnt = 512
 	} else {
 		maxMem := 60*1024 - r.Base
-		cnt = maxMem / (int(r.Size) + 64)
+		cnt = maxMem / (int(r.Size) + 256 / D)
 	}
 	switch {
 	case cnt == 512:
@@ -150,7 +248,7 @@ func main() {
 		fmt.Print("Unable to benchmark\n")
 		return
 	}
-	if err := runScript(b, cnt, &r); err != nil {
+	if err := runScript(b, cnt, 0, &r); err != nil {
 		errf("%v\n", err)
 	}
 	if r.Title != "" {
@@ -166,14 +264,14 @@ type Results struct {
 	Size  float64
 }
 
-func runScript(b *bench.Bench, cnt int, r *Results) error {
+func runScript(b *bench.Bench, cnt, pad int, r *Results) error {
 	var buf strings.Builder
 	if flags.Preamble != "" {
 		buf.WriteString(flags.Preamble)
 		buf.WriteString("\n")
 	}
 	for i := 0; i < cnt; i++ {
-		fmt.Fprintln(&buf, strings.Replace(flags.Code, "COUNT", fmt.Sprintf("%03d", i), -1))
+		fmt.Fprintln(&buf, strings.Replace(flags.Code, "CNT", fmt.Sprintf("%03d", i), -1))
 	}
 	if flags.Postamble != "" {
 		buf.WriteString(flags.Postamble)
@@ -183,7 +281,25 @@ func runScript(b *bench.Bench, cnt int, r *Results) error {
 	if flags.Title != "" {
 		title = `llOwnerSay("\nRESULT: TITLE=` + flags.Title + `");`
 	}
-	fmt.Fprintf(&buf, code, title, cnt, flags.Pad)
+	padding := flags.Pad
+	if pad > 0 {
+		padding += "integer i;\n"
+	}
+	if (pad&1) != 0 && pad >= 5 {
+		padding += "\njump Z; @Z;\n"
+		pad -= 5
+	}
+	if pad > 1 {
+		padding += "i"
+		pad -= 2
+		for pad > 1 {
+			padding += "+i"
+			pad -= 2
+		}
+		padding += ";\n"
+	}
+
+	fmt.Fprintf(&buf, code, title, cnt, padding)
 	script := buf.String()
 	if flags.Show {
 		fmt.Println(script)
