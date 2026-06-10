@@ -3,9 +3,11 @@ package main
 import (
 	"errors"
 	"fmt"
+	"math/bits"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/quark-idlemind/autobench/bench"
 
@@ -27,6 +29,9 @@ var flags = struct {
 	Globals   []string `getopt:"--globals=NAME,... declare globals"`
 	One       bool     `getopt:"-1 Using padding and a single copy of CODE"`
 	IPad      int      `getopt:"--ipad=N initial guess at padding for -1"`
+	Fast      bool     `getopt:"--fast skip looking for pad"`
+	Debug     bool     `getopt:"--debug enable debugging"`
+	Probe     bool     `getopt:"--probe send a simple script to LSL as a probe"`
 }{}
 
 func init() {
@@ -39,9 +44,63 @@ func errf(format string, v ...any) {
 	os.Exit(1)
 }
 
+func debugf(format string, v ...any) {
+	if flags.Debug {
+		fmt.Fprintf(os.Stderr, format, v...)
+	}
+}
+
 const plusminus = "±"
+const blockSize = int(512)
+
+func findPadding(b *bench.Bench, cnt, pad int) int {
+	var r Results
+	getBase := func() int { return r.Base }
+	if cnt > 0 {
+		getBase = func() int { return r.Test }
+	}
+	runScript(b, cnt, pad, &r)
+	debugf("Base[%d] %d : %d\n", cnt, pad, getBase())
+
+	var mid int
+	low := 0
+	high := blockSize
+	base := getBase()
+	for high-low > 1 {
+		mid = low + (high-low)/2
+		runScript(b, cnt, mid+pad, &r)
+		debugf("Check[%d] %d < %d < %d + %d : %d\n", cnt, low, mid, high, pad, getBase())
+		if base == getBase() {
+			low = mid
+		} else {
+			high = mid
+		}
+	}
+	for {
+		runScript(b, cnt, low+pad, &r)
+		debugf("Got[%d] %d + %d: %d\n", cnt, low, pad, getBase())
+		if base != getBase() {
+			return low
+		}
+		low++
+	}
+}
+
+const probeScript = `
+default {
+	state_entry() {
+		llOwnerSay("RESULT:Hello");
+		llOwnerSay("DONE");
+	}
+}
+`
 
 func main() {
+	defer func() {
+		if p := recover(); p != nil {
+			errf("%v\n", p)
+		}
+	}()
 	args := options.RegisterAndParse(&flags)
 	if flags.ChatLog == "" {
 		errf("Unable to find chat.txt\n")
@@ -52,6 +111,31 @@ func main() {
 	b, err := bench.New(flags.Source, flags.ChatLog)
 	if err != nil {
 		errf("%v\n", err)
+	}
+	if flags.Probe {
+		ch := make(chan struct{})
+		var results []string
+		go func() {
+			results, err = b.Send(probeScript)
+			close(ch)
+		}()
+		select {
+		case <-ch:
+			if err != nil {
+				errf("%v\n", err)
+			}
+			if len(results) == 0 {
+				errf("Script returned no results")
+			}
+			if results[0] != "Hello" {
+				errf("Got %q, want %q\n", results[0], "Hello")
+			}
+			fmt.Printf("SL Live\n")
+			return
+		case <-time.After(time.Minute):
+			errf("timed out waiting for Second Life\n")
+		}
+		return
 	}
 	switch {
 	case len(args) > 1:
@@ -114,143 +198,45 @@ func main() {
 	var r Results
 
 	if flags.One {
-		low := 0
-		high := 512
-		mid := (high - low) / 2
-		pad := 0
-		if flags.IPad != 0 {
-			if err := runScript(b, 0, flags.IPad-1, &r); err != nil {
-				errf("%v\n", err)
-			}
-			base := r.Base
-			if err := runScript(b, 0, flags.IPad, &r); err != nil {
-				errf("%v\n", err)
-			}
-			if base != r.Base {
-				pad = flags.IPad
-			} else {
-				mid = flags.IPad
-			}
-		} else {
-			if err := runScript(b, 0, 0, &r); err != nil {
-				errf("%v\n", err)
-			}
-		}
-		if pad == 0 {
-			base := r.Base
-			for high-low > 1 {
-				if err := runScript(b, 0, mid, &r); err != nil {
-					errf("%v\n", err)
-				}
-				if base == r.Base {
-					low = mid
-				} else {
-					high = mid
-				}
-				mid = low + (high-low)/2
-			}
-			if low > 4 {
-				if err := runScript(b, 0, low+1, &r); err != nil {
-					errf("%v\n", err)
-				}
-				if base == r.Base {
-					low++
-				}
-			}
-			pad = low + 1 // bump us over
-		}
-
-		if err := runScript(b, 1, pad, &r); err != nil {
-			errf("%v\n", err)
-		}
-		low = 0
-		high = 512
-		mid = (high - low) / 2
-		test := r.Test
-		for high-low > 1 {
-			if err := runScript(b, 1, mid+pad, &r); err != nil {
-				errf("%v\n", err)
-			}
-			if test == r.Test {
-				low = mid
-			} else {
-				high = mid
-			}
-			mid = low + (high-low)/2
-		}
-		if low > 4 {
-			if err := runScript(b, 1, low+1+pad, &r); err != nil {
-				errf("%v\n", err)
-			}
-			if test == r.Test {
-				low++
-			}
-		}
-		low += 1 // bumps us over
-		if err := runScript(b, 1, low+pad, &r); err != nil {
-			errf("%v\n", err)
-		}
+		// Find the smallest pad above 5 that
+		// that does not tip us into the next bucket.
+		pad := findPadding(b, 0, 5) + 5
+		pad = findPadding(b, 1, pad)
 
 		if r.Title != "" {
 			fmt.Printf("Title: %s\n", r.Title)
 		}
 
-		fmt.Printf("Padding: %d\n", pad)
-		fmt.Printf("Size: %d\n", r.Test - r.Base -low)
+		fmt.Printf("Size: %d\n", 512+r.Test-r.Base-pad)
 		return
 	}
 
+	// We should really always pad the base
+	pad := 0
+	if !flags.Fast {
+		pad = findPadding(b, 0, 5) + 5
+	}
 	// Get the base result
-	if err := runScript(b, 0, 0, &r); err != nil {
-		errf("%v\n", err)
-	}
+	runScript(b, 0, pad, &r)
 
-	D := 4
-	if err := runScript(b, D, 0, &r); err != nil {
-		errf("%v\n", err)
-	}
-/*
-	if r.Size == 0 {
-		D = 8
-		if err := runScript(b, D, 0, &r); err != nil {
-			errf("%v\n", err)
-		}
+	D := 8
+	runScript(b, D, pad, &r)
+	for r.Size == 0 {
+		D *= 2
+		runScript(b, D, pad, &r)
 	}
 	var cnt int
-*/
 	if r.Size == 0 {
-		cnt = 512
+		cnt = blockSize
 	} else {
-		maxMem := 60*1024 - r.Base
-		cnt = maxMem / (int(r.Size) + 256 / D)
+		maxMem := 62*1024 - r.Base
+		cnt = maxMem / (int(r.Size) + blockSize/(2*D))
+		cnt = int(1 << (bits.Len(uint(cnt)) - 1))
+		if cnt == 0 {
+			fmt.Print("Unable to benchmark\n")
+		}
 	}
-	switch {
-	case cnt == 512:
-	case cnt >= 256:
-		cnt = 256
-	case cnt >= 128:
-		cnt = 128
-	case cnt >= 64:
-		cnt = 64
-	case cnt >= 32:
-		cnt = 32
-	case cnt >= 16:
-		cnt = 16
-	case cnt >= 8:
-		cnt = 8
-	case cnt >= 4:
-		cnt = 4
-	case cnt >= 2:
-		cnt = 2
-	case cnt >= 1:
-		cnt = 1
-	default:
-		fmt.Print("Unable to benchmark\n")
-		return
-	}
-	if err := runScript(b, cnt, 0, &r); err != nil {
-		errf("%v\n", err)
-	}
+	runScript(b, cnt, pad, &r)
 	if r.Title != "" {
 		fmt.Printf("Title: %s\n", r.Title)
 	}
@@ -264,7 +250,24 @@ type Results struct {
 	Size  float64
 }
 
-func runScript(b *bench.Bench, cnt, pad int, r *Results) error {
+type Cache struct {
+	Count   int
+	Padding int
+}
+
+// cache prevents us from running the exact same script twice.
+var cache = map[Cache]Results{}
+
+func runScript(b *bench.Bench, cnt, pad int, r *Results) {
+	key := Cache{Count: cnt, Padding: pad}
+	if or, ok := cache[key]; ok {
+		debugf("Using cache for %v\n", key)
+		*r = or
+		return
+	}
+	defer func() {
+		cache[key] = *r
+	}()
 	var buf strings.Builder
 	if flags.Preamble != "" {
 		buf.WriteString(flags.Preamble)
@@ -299,14 +302,14 @@ func runScript(b *bench.Bench, cnt, pad int, r *Results) error {
 		padding += ";\n"
 	}
 
-	fmt.Fprintf(&buf, code, title, cnt, padding)
+	fmt.Fprintf(&buf, code, title, cnt, key.Padding, padding)
 	script := buf.String()
 	if flags.Show {
 		fmt.Println(script)
 	}
 	results, err := b.Send(script)
 	if err != nil {
-		return err
+		panic(err)
 	}
 	const (
 		BM    = "BASE_MEM="
@@ -326,33 +329,39 @@ func runScript(b *bench.Bench, cnt, pad int, r *Results) error {
 			r.Title = s[len(TITLE):]
 		}
 	}
-	return nil
 }
 
+// code is the boilerplate for autobench.  It is printed with 4 positional
+// parameters:
+//  1. statement to print title (if any)
+//  2. the number of times the CODE was repeated
+//  3. the amount of padding added
+//  4. instructions to pad the code size
 var code = `
-report(string msg) {
-	llOwnerSay("\nRESULT:" + msg);
-}
-
-result(integer mem, integer count) {
-    %s
+result(integer mem, integer count, integer padding) {
+	llOwnerSay("\n");
+    %s                      // Title
     if (count) {
         integer old = (integer)llLinksetDataRead("mem");
         string s = llLinksetDataRead("name");
-	report("TEST_MEM=" + (string)mem);
-	report("SIZE=" + (string)((float)(mem - old)/(float)count));
+		llOwnerSay("INFO  :COUNT=" + (string)count);
+		llOwnerSay("RESULT:SIZE=" + (string)((float)(mem - old)/(float)count));
+		llOwnerSay("RESULT:TEST_MEM=" + (string)mem);
+		llOwnerSay("INFO  :BASE_MEM=" + (string)old);
     } else {
         llLinksetDataWrite("mem", (string)mem);
-        report("BASE_MEM=" + (string)mem);
+        llOwnerSay("RESULT:BASE_MEM=" + (string)mem);
     }
+    llOwnerSay("INFO  :LAST_MEM=" + (string)llGetUsedMemory());
+	llOwnerSay("INFO  :PADDING=" + (string)padding);
     llOwnerSay("DONE");
+	return;
 }
 
 default {
     state_entry() {
-        result(llGetUsedMemory(), %d);
-	return;
-	%s
+		result(llGetUsedMemory(), %d, %d);
+        %s                  // Padding
     }
 }`
 
